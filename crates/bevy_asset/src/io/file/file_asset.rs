@@ -3,8 +3,10 @@ use crate::io::{
     PathStream, Reader, Writer,
 };
 use async_fs::{read_dir, File};
-use futures_io::AsyncSeek;
+use async_lock::SemaphoreGuard;
+use futures_io::{AsyncRead, AsyncSeek};
 use futures_lite::StreamExt;
+use tracing::info;
 
 use core::{pin::Pin, task, task::Poll};
 use std::path::Path;
@@ -30,29 +32,89 @@ impl AsyncSeekForward for File {
     }
 }
 
+pub struct SemaphoreFile<'a>{
+    pub file: File,
+    pub _semaphore: SemaphoreGuard<'a>,
+}
+
+impl<'a> AsyncSeekForward for SemaphoreFile<'a>{
+    fn poll_seek_forward(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        offset: u64,
+    ) -> Poll<futures_io::Result<u64>> {
+        let offset: Result<i64, _> = offset.try_into();
+
+        if let Ok(offset) = offset {
+            Pin::new(&mut self.file).poll_seek(cx, futures_io::SeekFrom::Current(offset))
+        } else {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek position is out of range",
+            )))
+        }
+    }
+}
+
+impl<'a> AsyncSeek for SemaphoreFile<'a>{
+    fn poll_seek(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        pos: std::io::SeekFrom,
+    ) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.file).poll_seek(cx, pos)
+    }
+}
+
+impl<'a> AsyncRead for SemaphoreFile<'a>{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+impl<'a> Reader for SemaphoreFile<'a> {}
+
 impl Reader for File {}
 
 impl AssetReader for FileAssetReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+        let guard = self.descriptor_counter.acquire().await;
+
         let full_path = self.root_path.join(path);
-        File::open(&full_path).await.map_err(|e| {
+        let file = File::open(&full_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AssetReaderError::NotFound(full_path)
             } else {
                 e.into()
             }
+        });
+
+        Ok(SemaphoreFile {
+            _semaphore: guard,
+            file: file?,
         })
     }
 
     async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+        let guard = self.descriptor_counter.acquire().await;
+
         let meta_path = get_meta_path(path);
         let full_path = self.root_path.join(meta_path);
-        File::open(&full_path).await.map_err(|e| {
+        let file = File::open(&full_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 AssetReaderError::NotFound(full_path)
             } else {
                 e.into()
             }
+        });
+
+        Ok(SemaphoreFile{
+            file: file?,
+            _semaphore: guard,
         })
     }
 
@@ -61,6 +123,7 @@ impl AssetReader for FileAssetReader {
         path: &'a Path,
     ) -> Result<Box<PathStream>, AssetReaderError> {
         let full_path = self.root_path.join(path);
+
         match read_dir(&full_path).await {
             Ok(read_dir) => {
                 let root_path = self.root_path.clone();
@@ -91,6 +154,8 @@ impl AssetReader for FileAssetReader {
     }
 
     async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
+        let _guard = self.descriptor_counter.acquire().await;
+
         let full_path = self.root_path.join(path);
         let metadata = full_path
             .metadata()
